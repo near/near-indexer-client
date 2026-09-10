@@ -16,8 +16,11 @@ enables release jobs after initial setup.
 
 crates.io requires a maintainer token for the first publication. The initial
 `0.1.0` upload is performed with `cargo publish --locked` after CI passes. Then
-configure trusted publishing and dispatch `release-plz.yml` to create the tag,
-GitHub release, and attestation for the same source/package bytes.
+configure trusted publishing and dispatch `release-plz.yml` with
+`attest_existing=true` to attest the same source/package bytes. Create the initial
+`v0.1.0` tag and GitHub release from that exact commit after verification.
+The same dispatch option can recover an attestation after a successful upload
+whose attestation step failed. A byte mismatch fails the job.
 
 The release-PR job uses `GITHUB_TOKEN` and explicitly dispatches CI for its
 branch because GitHub suppresses ordinary PR-triggered workflows for that token.

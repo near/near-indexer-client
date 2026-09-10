@@ -68,12 +68,14 @@ contains the flattened `StreamerMessage` (`block` and `shards`) plus
 `tracked_shards`. Use a nearcore build containing that change and matching
 protocol types.
 
-As of September 10, 2026, the `2.14-release` branch exists but does **not** contain
-#16407. A version or branch name alone does not establish endpoint availability;
-verify the actual node build and its configuration. Historical requests also
-require outcome and state-change saving throughout the requested history and
-retained execution metadata. Archive mode alone is insufficient. The endpoint
-does not support SPICE execution.
+For a 2.14-series deployment, use a `2.14-release` build containing #16407 and
+verify the actual node configuration. A version or branch name alone does not
+establish endpoint availability. Published 2.14 node and sandbox artifacts have
+not yet been validated with this client.
+
+Historical requests require outcome and state-change saving throughout the
+requested history and retained execution metadata. Archive mode alone is
+insufficient. The endpoint does not support SPICE execution.
 
 This crate is prepared for `near/near-indexer-client`; the initial repository and
 crates.io publication are separate release steps. It is not yet published.

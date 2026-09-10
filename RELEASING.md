@@ -9,8 +9,8 @@ Before the first release:
    metadata points to it, and choose `main` as the default branch used by CI.
 2. Confirm crates.io name availability and the intended maintainer/organization
    ownership. An absent registry entry does not reserve the name.
-3. Confirm the serving nearcore build contains #16407 and test against it. Check
-   actual `2.14-release` inclusion before updating the README compatibility note.
+3. Confirm the serving nearcore build contains #16407 and test against it. Verify
+   the exact published artifact before declaring support for a node release.
 4. Keep the 0.37.4 protocol compatibility shim until a fixed published dependency
    has been verified; do not remove it merely because nearcore master is fixed.
 5. Inspect `cargo package --list` for unintended files. The bundled fixture

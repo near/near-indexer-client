@@ -114,7 +114,7 @@ pub struct Update {
 }
 
 /// Which head to follow. Optimistic consumers must implement rollback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Finality {
     /// Fully finalized head; any attempted rollback is an error.

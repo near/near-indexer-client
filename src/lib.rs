@@ -128,7 +128,7 @@ pub enum Finality {
 pub enum Error {
     /// Transport, RPC, or typed payload decoding failure.
     #[error(transparent)]
-    Rpc(#[from] RpcError),
+    Rpc(#[from] Box<RpcError>),
     /// Missing coverage, inconsistent hashes, or malformed ancestry.
     #[error("invalid indexer data: {0}")]
     InvalidData(&'static str),
@@ -138,6 +138,12 @@ pub enum Error {
     /// A finalized head would replace already processed state.
     #[error("final head would roll back processed state")]
     FinalityViolation,
+}
+
+impl From<RpcError> for Error {
+    fn from(error: RpcError) -> Self {
+        Self::Rpc(Box::new(error))
+    }
 }
 
 /// Sequential, pull-based indexing; consumer speed supplies backpressure.

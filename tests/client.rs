@@ -178,6 +178,34 @@ fn split_null_and_missing_remain_distinct() {
 }
 
 #[tokio::test]
+async fn explicit_target_stays_pinned_and_does_not_claim_finality() {
+    let (client, state) = setup(Finality::Final, 10, 0);
+    state.lock().unwrap().head = hash(6);
+    let update = client
+        .update_to(Some(&checkpoint(1, 1)), hash(3))
+        .await
+        .unwrap();
+    assert_eq!(hashes(&update.blocks), [hash(2), hash(3)]);
+    assert_eq!(update.next_checkpoint, checkpoint(3, 4));
+    assert_eq!(update.finality, Finality::Optimistic);
+}
+
+#[tokio::test]
+async fn explicit_target_rejects_wrong_header_and_excessive_ancestry() {
+    let (client, state) = setup(Finality::Optimistic, 1, 0);
+    assert!(matches!(
+        client.update_to(Some(&checkpoint(1, 1)), hash(3)).await,
+        Err(Error::AncestryLimit(1))
+    ));
+    state.lock().unwrap().blocks.get_mut(&hash(3)).unwrap()["block"]["header"]["hash"] =
+        json!(hash(5));
+    assert!(matches!(
+        client.update_to(None, hash(3)).await,
+        Err(Error::InvalidData(_))
+    ));
+}
+
+#[tokio::test]
 async fn catches_up_by_hash_across_skipped_heights() {
     let (client, _) = setup(Finality::Final, 10, 0);
     let update = client.poll(Some(&checkpoint(1, 1))).await.unwrap();

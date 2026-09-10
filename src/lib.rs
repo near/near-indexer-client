@@ -100,7 +100,7 @@ impl<'de> Deserialize<'de> for IndexerBlock {
 /// Work to apply atomically with its checkpoint; dropping it acknowledges nothing.
 #[derive(Debug)]
 pub struct Update {
-    /// Finality requested when sampling the head.
+    /// Finality requested when sampling the head; explicit targets are optimistic.
     pub finality: Finality,
     /// Sampled head and its recorded finality marker.
     pub head: Header,
@@ -213,8 +213,38 @@ impl Client {
         let head = self
             .block_header(json!({"finality": self.finality}))
             .await?;
+        self.update(checkpoint, head, self.finality).await
+    }
+
+    /// Build an update to an exact target without resampling the moving head.
+    ///
+    /// Explicit targets carry [`Finality::Optimistic`]: a hash alone does not
+    /// establish finality. Ancestry, coverage, and checkpoint rules match [`Self::poll`].
+    pub async fn update_to(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        target: CryptoHash,
+    ) -> Result<Update, Error> {
+        if self.max_ancestry == 0 {
+            return Err(Error::AncestryLimit(0));
+        }
+        let head = self.block_header(json!({"block_id": target})).await?;
+        if head.hash != target {
+            return Err(Error::InvalidData(
+                "target hash differs from returned header",
+            ));
+        }
+        self.update(checkpoint, head, Finality::Optimistic).await
+    }
+
+    async fn update(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        head: Header,
+        finality: Finality,
+    ) -> Result<Update, Error> {
         let (rollback, apply) = self.plan(checkpoint, head).await?;
-        if self.finality == Finality::Final && !rollback.is_empty() {
+        if finality == Finality::Final && !rollback.is_empty() {
             return Err(Error::FinalityViolation);
         }
         let mut blocks = Vec::with_capacity(apply.len());
@@ -232,7 +262,7 @@ impl Client {
             blocks.push(block);
         }
         Ok(Update {
-            finality: self.finality,
+            finality,
             head,
             rollback,
             blocks,

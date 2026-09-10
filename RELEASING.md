@@ -17,7 +17,10 @@ enables release jobs after initial setup.
 crates.io requires a maintainer token for the first publication. The initial
 `0.1.0` upload is performed with `cargo publish --locked` after CI passes. Then
 configure trusted publishing and dispatch `release-plz.yml` with
-`attest_existing=true` to attest the same source/package bytes. Create the initial
+`attest_existing=true` to verify OIDC authentication and attest the same
+source/package bytes. This optional check uses the official crates.io auth
+action and revokes its token on completion; normal release-plz publication
+performs its own authentication. Create the initial
 `v0.1.0` tag and GitHub release from that exact commit after verification.
 The same dispatch option can recover an attestation after a successful upload
 whose attestation step failed. A byte mismatch fails the job.

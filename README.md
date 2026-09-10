@@ -77,8 +77,8 @@ Historical requests require outcome and state-change saving throughout the
 requested history and retained execution metadata. Archive mode alone is
 insufficient. The endpoint does not support SPICE execution.
 
-This crate is prepared for `near/near-indexer-client`; the initial repository and
-crates.io publication are separate release steps. It is not yet published.
+Install from crates.io with `cargo add near-indexer-client`.
+Source: <https://github.com/near/near-indexer-client>.
 
 The experimental endpoint/schema must match the serving node. Tests include captured real block and receipt payloads;
 this is not a promise to preserve arbitrary future fields or variants. A small
@@ -110,6 +110,6 @@ fsyncs its temporary file but not the parent directory. Production consumers
 should commit their data and checkpoint in the same database transaction.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development checks and
-[RELEASING.md](RELEASING.md) for the initial publication checklist.
+[RELEASING.md](RELEASING.md) for the release workflow and artifact verification.
 
 Licensed under MIT or Apache-2.0.

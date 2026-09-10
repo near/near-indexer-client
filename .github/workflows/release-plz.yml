@@ -1,0 +1,105 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'near/near-indexer-client' && github.ref == 'refs/heads/main' && vars.RELEASE_ENABLED == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Publish and attest
+    needs: validate
+    runs-on: warp-ubuntu-2404-x64-4x
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-provider: warpbuild
+      - name: Package the checked source
+        run: cargo package --locked
+      - name: Release
+        id: release
+        uses: release-plz/action@346832d73e3415c2ebd0432cba3a2bf5881e5f7d # v0.5.135
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify published bytes match this build
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: |
+          version=$(jq -er '.[0].version' <<< "$RELEASES")
+          crate="near-indexer-client-${version}.crate"
+          curl --fail --silent --show-error --location --retry 5             "https://static.crates.io/crates/near-indexer-client/${crate}"             --output "${RUNNER_TEMP}/${crate}"
+          cmp "target/package/${crate}" "${RUNNER_TEMP}/${crate}"
+      - name: Attest published crate
+        if: steps.release.outputs.releases_created == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: target/package/near-indexer-client-*.crate
+
+  release-pr:
+    name: Prepare release PR
+    needs: validate
+    runs-on: warp-ubuntu-2404-x64-4x
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-provider: warpbuild
+      - name: Prepare release PR
+        id: release-pr
+        uses: release-plz/action@346832d73e3415c2ebd0432cba3a2bf5881e5f7d # v0.5.135
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # PR events created with GITHUB_TOKEN do not trigger other workflows.
+      - name: Run CI on the release PR
+        if: steps.release-pr.outputs.pr != '' && steps.release-pr.outputs.pr != 'null'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PR: ${{ steps.release-pr.outputs.pr }}
+        run: |
+          branch=$(jq -er '.head_branch' <<< "$RELEASE_PR")
+          gh workflow run ci.yml --ref "$branch"

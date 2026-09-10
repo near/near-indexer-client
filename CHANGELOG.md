@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## [0.1.0] - 2026-09-10
 
 - Fetch complete indexer messages by immutable block hash over NEAR JSON-RPC.
 - Follow finalized or optimistic heads with consumer-owned checkpoints, bounded

@@ -5,11 +5,13 @@ Rust version is promised yet; the initial local checks used Rust 1.96.0. Keep
 Cargo.lock committed so CI and package verification use the reviewed dependency
 resolution.
 
-Run the same checks as CI:
+Install [cargo-nextest](https://nexte.st/docs/installation/), then run the same
+checks as CI:
 
 ```sh
 cargo fmt --all -- --check
-cargo test --locked
+cargo nextest run --locked --all-targets
+cargo test --locked --doc
 cargo clippy --locked --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo package --locked

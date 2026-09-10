@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "Pull-based NEAR HTTP indexing with consumer-owned checkpoints"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/near/near-indexer-client"
+documentation = "https://docs.rs/near-indexer-client"
+keywords = ["near", "indexer", "rpc", "blockchain"]
+categories = ["api-bindings", "asynchronous"]
+include = ["src/**", "examples/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "RELEASING.md", "LICENSE-*"]
 
 [dependencies]
 near-indexer-primitives = "0.37.4"

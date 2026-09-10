@@ -49,7 +49,8 @@ shard coverage fail closed. Resuming against another endpoint requires the same
 checkpoint ancestry. The client trusts the node's chain/finality assertions; it
 does not perform consensus or cryptographic proof verification.
 
-The serving node must enable `EXPERIMENTAL_indexer_block` and track every shard.
+The serving node must enable `rpc.enable_indexer_rpc` and track every shard.
+The endpoint is disabled by default.
 The method accepts `{"block_hash":"..."}`, not height/finality. Both reported
 coverage and supplied shard IDs must exactly match the block's chunk shards.
 Carried chunks can still have `chunk: null`; full tracking does not make a chunk
@@ -61,20 +62,37 @@ silently treated as a successful empty block.
 
 This crate uses published near-kit 0.18.0 and near-indexer-primitives 0.37.4. It
 retains official protocol/crypto types but has no node, VM, store, network actor,
-or embedded indexer runtime dependency. The experimental endpoint/schema must
-match the serving node. Tests include captured real block and receipt payloads;
+or embedded indexer runtime dependency. The endpoint follows the schema merged in
+[nearcore #16407](https://github.com/near/nearcore/pull/16407): the RPC result
+contains the flattened `StreamerMessage` (`block` and `shards`) plus
+`tracked_shards`. Use a nearcore build containing that change and matching
+protocol types.
+
+As of September 10, 2026, the `2.14-release` branch exists but does **not** contain
+#16407. A version or branch name alone does not establish endpoint availability;
+verify the actual node build and its configuration. Historical requests also
+require outcome and state-change saving throughout the requested history and
+retained execution metadata. Archive mode alone is insufficient. The endpoint
+does not support SPICE execution.
+
+This crate is prepared for `near/near-indexer-client`; the initial repository and
+crates.io publication are separate release steps. It is not yet published.
+
+The experimental endpoint/schema must match the serving node. Tests include captured real block and receipt payloads;
 this is not a promise to preserve arbitrary future fields or variants. A small
 deserialization shim preserves explicit `proposed_split: null` values that the
-published protocol types otherwise conflate with an absent field. It can be
-removed once the upstream fix is released.
+published protocol types otherwise conflate with an absent field. Keep this shim until the fix is present in the published types selected by
+this crate and the null/absent-field regression test passes without it.
 
 ## Example and checks
 
 ```sh
 cargo run --example poll -- http://127.0.0.1:3030 final /tmp/checkpoint.json 10
-cargo test
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+cargo package --locked
 ```
 
 Example arguments are `URL final|optimistic CHECKPOINT_FILE BLOCK_COUNT
@@ -88,5 +106,8 @@ between those steps can duplicate output; it demonstrates at-least-once replay,
 not an atomic external sink. Use one writer per checkpoint file. The example
 fsyncs its temporary file but not the parent directory. Production consumers
 should commit their data and checkpoint in the same database transaction.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development checks and
+[RELEASING.md](RELEASING.md) for the initial publication checklist.
 
 Licensed under MIT or Apache-2.0.

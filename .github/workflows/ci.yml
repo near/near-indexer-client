@@ -30,7 +30,7 @@ jobs:
         with:
           cache-provider: warpbuild
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-nextest
       - run: cargo fmt --all -- --check

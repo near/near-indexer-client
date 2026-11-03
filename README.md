@@ -1,133 +1,113 @@
 # near-indexer-client
 
-A small pull-based client for NEAR's experimental HTTP indexer endpoint. It uses
-near-kit for HTTP/RPC and the official `StreamerMessage` types for blocks,
-transactions, receipts, execution outcomes, and state changes.
+Follow the NEAR chain from your own code, without running a node.
+
+`near-indexer-client` reads complete blocks from a NEAR RPC node's
+`EXPERIMENTAL_indexer_block` endpoint: every transaction, receipt, execution
+outcome, and state change, as the standard `StreamerMessage`. You keep a
+checkpoint; the client tells you what to apply next.
+
+```sh
+cargo add near-indexer-client
+```
+
+## Quick start
 
 ```rust
-use near_indexer_client::{Client, Finality};
-use near_kit::rpc::RpcClient;
+use near_indexer_client::near_kit::rpc::RpcClient;
+use near_indexer_client::{Checkpoint, Client, Finality};
 
-async fn example() -> Result<(), near_indexer_client::Error> {
-let client = Client::new(RpcClient::new("http://127.0.0.1:3030"), Finality::Final, 1000);
-let update = client.poll(None).await?; // None starts with the current head only.
-for block in &update.blocks {
-    println!("{}", block.message.block.header.hash);
-}
-// Process the whole update and persist update.next_checkpoint together.
-// Pass that saved checkpoint to the next poll.
-Ok(())
+async fn follow(mut checkpoint: Option<Checkpoint>) -> Result<(), near_indexer_client::Error> {
+    let client = Client::new(RpcClient::new("http://127.0.0.1:3030"), Finality::Final, 1000);
+    loop {
+        let update = client.poll(checkpoint.as_ref()).await?;
+        for block in &update.blocks {
+            println!("{}", block.message.block.header.height);
+        }
+        // Save your results and `update.next_checkpoint` in one transaction.
+        checkpoint = Some(update.next_checkpoint);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 ```
 
-`fetch(hash)` reads one exact block. `poll(checkpoint)` samples a final or
-optimistic head, follows parent hashes to the saved checkpoint/common ancestor,
-and fetches a complete update. Heights may have gaps. A saved checkpoint is
-exclusive: its block is assumed already processed. The returned update includes
-its sampled head, that block's `last_final_block` marker, and requested finality,
-even when there are no blocks to apply. The marker is not a separately sampled
-current finalized head.
+Start with `None` to begin at the current head. After that, always pass the last
+checkpoint you saved.
 
-`poll` holds the whole update in memory and fails it as a unit. For a long
-catch-up, call `head()` and `plan(checkpoint, head)` instead: the plan carries only
-headers, and `fetch_block(header)` fetches each planned block and checks it
-against its header. Apply and checkpoint the blocks in chunks of your choosing,
-so memory stays bounded and a failed request repeats only that block.
-`header(hash)` and `parent(header)` walk ancestry to a starting point of your own.
+## How it works
 
-Optimistic updates contain rollback headers newest first and replacement blocks
-oldest first, including when two heads have the same height. Undo those headers,
-apply all blocks, and save `next_checkpoint` in one consumer transaction. Ancestry
-rollback can extend before the first block originally consumed; tolerate absent
-undo entries, or start from a suitable finalized checkpoint. Final mode rejects
-any rollback.
+- **You own the checkpoint.** The client keeps no cursor, queue, database, or
+  background task. A checkpoint is exclusive: its block counts as already
+  processed. If you crash before saving, the next poll replays the same blocks.
+- **Updates are all or nothing.** `poll` either returns every block you need,
+  or an error with your checkpoint untouched. It never returns a partial or
+  silently empty block.
+- **Final or optimistic.** `Finality::Final` follows finalized blocks and never
+  rolls back. `Finality::Optimistic` follows the latest head. When the head
+  changes branch, the update lists `rollback` headers (newest first) to undo
+  before applying `blocks` (oldest first), including same-height replacements.
+- **Long catch-ups stay bounded.** `poll` holds a whole update in memory. If
+  you're far behind, call `head()` and `plan(checkpoint, head)` to get headers
+  only, then `fetch_block` each one and save a checkpoint every few blocks. A
+  failed request repeats only that block.
+- **Gaps are fine.** Heights can skip; the client follows parent hashes, not
+  heights, and a shard with no new chunk in a block has `chunk: None`.
+  `max_ancestry` (the last argument to `Client::new`) caps how far one
+  update may walk, and exceeding it is an error rather than a truncated batch.
 
-The client owns no cursor, queue, database, or background task. Consumer speed
-supplies backpressure. Dropping an update acknowledges nothing. A failed block
-fetch returns no partial update, so retrying the old checkpoint replays the batch.
-Queue insertion alone is not durable processing acknowledgment. Applications
-choose when to poll again, their persistence, and their retry policy through the
-provided `RpcClient`.
+## Errors and retries
 
-The configured positive ancestry limit bounds rollback plus apply blocks in one
-update; zero rejects polling. Exceeding it returns `AncestryLimit`, never a
-truncated batch. Missing/pruned history, inconsistent ancestry, and incomplete
-shard coverage fail closed. Resuming against another endpoint requires the same
-checkpoint ancestry. The client trusts the node's chain/finality assertions; it
-does not perform consensus or cryptographic proof verification.
+The client never sleeps or retries on its own. You decide when to try again.
 
-The serving node must enable `rpc.enable_indexer_rpc` and track every shard.
-The endpoint is disabled by default.
-The method accepts `{"block_hash":"..."}`, not height/finality. Both reported
-coverage and supplied shard IDs must exactly match the block's chunk shards.
-Carried chunks can still have `chunk: null`; full tracking does not make a chunk
-new. near-kit's configured retries handle transient transport/server errors;
-exhaustion is returned with the checkpoint untouched. Missing data is never
-silently treated as a successful empty block.
+- `Error::kind()` names the failure, using the node's error name where it has
+  one (`BUSY`, `DATA_UNAVAILABLE`, `LIMIT_EXCEEDED`, ...).
+- `RetryPolicy` and `Backoff` pace retries per request. A busy, timed-out, or
+  unreachable node backs off from 500 ms to 10 s. Missing data stays retryable
+  for 30 s, since a node can announce a head before it saves the data.
+  Everything else backs off up to 60 s.
+- If you use `Backoff`, build the `RpcClient` with `RetryConfig::none()` so
+  near-kit's own retries don't stack underneath.
+- An error tied to one block, such as a response over the node's size limit,
+  hits every consumer of that block. It needs a fix on the node, not a retry.
 
-`Error::kind()` names the failure, from the endpoint's error name where it has
-one (`BUSY`, `DATA_UNAVAILABLE`, `LIMIT_EXCEEDED`, ...). `RetryPolicy` turns it
-into a per-request `Backoff`: busy, timed-out and unreachable endpoints are
-transient, retried from 500 ms doubling to 10 s; unavailable data is transient
-for 30 s from the request's first failure, since an endpoint may announce a head
-before saving its data; anything else is persistent and backs off up to 60 s. A
-persistent block error such as `LIMIT_EXCEEDED` affects every consumer of that
-block and needs a fix on the serving node. The client still never sleeps or
-retries on its own. When pacing retries with `Backoff`, build the `RpcClient`
-with `RetryConfig::none()` so near-kit's retries do not stack underneath.
+## Running a serving node
 
-## Dependencies and compatibility
+Public RPC endpoints don't offer this method. You need a node you control,
+running nearcore 2.14.0 or later, with:
 
-This crate uses published near-kit 0.18.0 and near-indexer-primitives 0.37.4. It
-retains official protocol/crypto types but has no node, VM, store, network actor,
-or embedded indexer runtime dependency. The endpoint follows the schema merged in
-[nearcore #16407](https://github.com/near/nearcore/pull/16407): the RPC result
-contains the flattened `StreamerMessage` (`block` and `shards`) plus
-`tracked_shards`. Use a nearcore build containing that change and matching
-protocol types.
+```json
+{
+  "rpc": { "enable_indexer_rpc": true },
+  "tracked_shards_config": "AllShards",
+  "save_tx_outcomes": true,
+  "save_state_changes": true,
+  "store": { "save_trie_changes": true }
+}
+```
 
-For a 2.14-series deployment, use a `2.14-release` build containing #16407 and
-verify the actual node configuration. A version or branch name alone does not
-establish endpoint availability. Published 2.14 node and sandbox artifacts have
-not yet been validated with this client.
+The node can only serve history it kept with these settings on, and archive
+mode alone isn't enough. By default it serves one indexer request at a time
+and rejects the rest with `BUSY`; raise `rpc.indexer_max_concurrent_requests`
+if several consumers share it. The method isn't available under Spice
+execution.
 
-Historical requests require outcome and state-change saving throughout the
-requested history and retained execution metadata. Archive mode alone is
-insufficient. The endpoint does not support SPICE execution.
+The client trusts the node's view of the chain. It checks that every shard is
+present and that blocks link up, but it doesn't verify consensus or proofs.
 
-Install from crates.io with `cargo add near-indexer-client`.
-Source: <https://github.com/near/near-indexer-client>.
-
-The experimental endpoint/schema must match the serving node. Tests include captured real block and receipt payloads;
-this is not a promise to preserve arbitrary future fields or variants. A small
-deserialization shim preserves explicit `proposed_split: null` values that the
-published protocol types otherwise conflate with an absent field. Keep this shim until the fix is present in the published types selected by
-this crate and the null/absent-field regression test passes without it.
-
-## Example and checks
+## Example
 
 ```sh
 cargo run --example poll -- http://127.0.0.1:3030 final /tmp/checkpoint.json 10
-cargo fmt --all -- --check
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-cargo package --locked
 ```
 
-Example arguments are `URL final|optimistic CHECKPOINT_FILE BLOCK_COUNT
-[START_HASH]`. The optional start hash is an **exclusive** checkpoint and an
-existing checkpoint file takes precedence. The count is a minimum: complete
-catch-up batches are processed together. The example prints JSON lines including
-ancestry, transaction counts, and receipt IDs, receivers, and execution statuses.
+The arguments are `URL final|optimistic CHECKPOINT_FILE BLOCK_COUNT [START_HASH]`.
+It prints one JSON line per block and saves its checkpoint to a file after each
+update. A real consumer should save its data and checkpoint in the same
+database transaction instead.
 
-The stdout example flushes output before replacing its checkpoint. A crash
-between those steps can duplicate output; it demonstrates at-least-once replay,
-not an atomic external sink. Use one writer per checkpoint file. The example
-fsyncs its temporary file but not the parent directory. Production consumers
-should commit their data and checkpoint in the same database transaction.
+## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development checks and
-[RELEASING.md](RELEASING.md) for the release workflow and artifact verification.
+[RELEASING.md](RELEASING.md) for the release process.
 
 Licensed under MIT or Apache-2.0.

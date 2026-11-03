@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/near/near-indexer-client/compare/v0.1.0...v0.2.0) - 2026-11-03
+
+### Added
+
+- [**breaking**] build against nearcore 2.14 crates and catch up in bounded, retryable chunks ([#3](https://github.com/near/near-indexer-client/pull/3))
+
 - Depend on `near-indexer-primitives 0.38` and `near-kit 0.20`, matching nearcore
   2.14. The 0.37 primitives pin `aws-lc-rs = "=1.16.2"`, which cannot resolve
   alongside nearcore 2.14 crates.

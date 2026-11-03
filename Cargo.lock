@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "near-indexer-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "near-indexer-primitives",
  "near-kit",

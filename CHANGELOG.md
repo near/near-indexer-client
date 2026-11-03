@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/near/near-indexer-client/compare/v0.2.0...v0.2.1) - 2026-11-03
+
+### Other
+
+- rewrite the README around getting started ([#5](https://github.com/near/near-indexer-client/pull/5))
+
 ## [0.2.0](https://github.com/near/near-indexer-client/compare/v0.1.0...v0.2.0) - 2026-11-03
 
 ### Added

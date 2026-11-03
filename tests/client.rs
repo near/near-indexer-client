@@ -2,7 +2,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use near_indexer_client::{Checkpoint, Client, CryptoHash, Error, Finality, IndexerBlock};
+use std::time::Duration;
+
+use near_indexer_client::{
+    Checkpoint, Client, CryptoHash, Error, ErrorKind, Failure, Finality, IndexerBlock, RetryPolicy,
+};
 use near_kit::rpc::{BoxFuture, RetryConfig, RpcClient, RpcError, RpcTransport, TransportResponse};
 use serde_json::{Value, json};
 
@@ -345,4 +349,160 @@ async fn bounded_or_missing_ancestry_and_bad_checkpoint_fail_closed() {
         zero.poll(None).await,
         Err(Error::AncestryLimit(0))
     ));
+}
+
+#[tokio::test]
+async fn plan_and_fetch_block_catch_up_in_chunks_like_poll() {
+    let (client, state) = setup(Finality::Optimistic, 10, 0);
+    state.lock().unwrap().head = hash(6);
+    let update = client.poll(Some(&checkpoint(3, 4))).await.unwrap();
+    state.lock().unwrap().indexer_requests = 0;
+
+    let head = client.head().await.unwrap();
+    let plan = client.plan(Some(&checkpoint(3, 4)), head).await.unwrap();
+    assert_eq!(state.lock().unwrap().indexer_requests, 0);
+    assert_eq!(plan.head, update.head);
+    assert_eq!(plan.rollback, update.rollback);
+    let mut applied = vec![];
+    let mut saved = checkpoint(3, 4);
+    for chunk in plan.apply.chunks(2) {
+        for header in chunk {
+            applied.push(client.fetch_block(header).await.unwrap());
+        }
+        saved = chunk.last().unwrap().checkpoint();
+    }
+    assert_eq!(hashes(&applied), hashes(&update.blocks));
+    assert_eq!(saved, update.next_checkpoint);
+}
+
+#[tokio::test]
+async fn plan_applies_finality_and_ancestry_limits_without_fetching() {
+    let (client, state) = setup(Finality::Final, 10, 0);
+    state.lock().unwrap().head = hash(5);
+    let head = client.head().await.unwrap();
+    assert!(matches!(
+        client.plan(Some(&checkpoint(3, 4)), head).await,
+        Err(Error::FinalityViolation)
+    ));
+    let (limited, _) = setup(Finality::Optimistic, 1, 0);
+    let head = limited.header(hash(3)).await.unwrap();
+    assert!(matches!(
+        limited.plan(Some(&checkpoint(1, 1)), head).await,
+        Err(Error::AncestryLimit(1))
+    ));
+    assert_eq!(state.lock().unwrap().indexer_requests, 0);
+}
+
+#[tokio::test]
+async fn header_parent_and_fetch_block_check_hash_ancestry() {
+    let (client, state) = setup(Finality::Final, 10, 0);
+    let header = client.header(hash(5)).await.unwrap();
+    assert_eq!(header.height, 4);
+    let parent = client.parent(&header).await.unwrap();
+    assert_eq!(parent.checkpoint(), checkpoint(4, 3));
+    assert_eq!(
+        client
+            .fetch_block(&parent)
+            .await
+            .unwrap()
+            .message
+            .block
+            .header
+            .hash,
+        hash(4)
+    );
+    let mut wrong = parent;
+    wrong.height = 2;
+    assert!(matches!(
+        client.fetch_block(&wrong).await,
+        Err(Error::InvalidData(_))
+    ));
+    state.lock().unwrap().blocks.get_mut(&hash(4)).unwrap()["block"]["header"]["height"] = json!(5);
+    assert!(matches!(
+        client.parent(&header).await,
+        Err(Error::InvalidData(_))
+    ));
+}
+
+#[tokio::test]
+async fn error_kind_names_endpoint_errors() {
+    let (client, state) = setup(Finality::Final, 10, 0);
+    state.lock().unwrap().busy = 1;
+    assert_eq!(
+        client.fetch(hash(1)).await.unwrap_err().kind(),
+        ErrorKind::Busy
+    );
+    state.lock().unwrap().unavailable = Some(hash(1));
+    assert_eq!(
+        client.fetch(hash(1)).await.unwrap_err().kind(),
+        ErrorKind::DataUnavailable
+    );
+    let too_large = Error::from(RpcError::Rpc {
+        code: -32000,
+        message: "Server error".to_owned(),
+        data: Some(json!({"name": "LIMIT_EXCEEDED"})),
+    });
+    assert_eq!(too_large.kind(), ErrorKind::LimitExceeded);
+    assert_eq!(too_large.kind().as_str(), "limit_exceeded");
+    assert_eq!(Error::InvalidData("broken").kind(), ErrorKind::InvalidData);
+    assert_eq!(
+        Error::from(RpcError::Timeout(1)).kind(),
+        ErrorKind::Unavailable
+    );
+}
+
+#[test]
+fn backoff_caps_transient_and_persistent_delays() {
+    let policy = RetryPolicy::default();
+    let mut backoff = policy.backoff();
+    let busy = Error::from(RpcError::Rpc {
+        code: -32000,
+        message: "Server error".to_owned(),
+        data: Some(json!({"name": "BUSY"})),
+    });
+    let transient: Vec<_> = (0..6)
+        .map(|_| backoff.next(&busy, Duration::ZERO).delay)
+        .collect();
+    assert_eq!(
+        transient,
+        [500, 1_000, 2_000, 4_000, 8_000, 10_000].map(Duration::from_millis)
+    );
+    let invalid = Error::InvalidData("broken");
+    let persistent: Vec<_> = (0..3)
+        .map(|_| backoff.next(&invalid, Duration::ZERO))
+        .collect();
+    assert!(
+        persistent
+            .iter()
+            .all(|retry| retry.failure == Failure::Persistent)
+    );
+    assert_eq!(
+        persistent
+            .iter()
+            .map(|retry| retry.delay)
+            .collect::<Vec<_>>(),
+        [32, 60, 60].map(Duration::from_secs)
+    );
+}
+
+#[test]
+fn unavailable_data_turns_persistent_after_the_grace_from_the_first_failure() {
+    let policy = RetryPolicy::default();
+    let grace = policy.data_unavailable_grace;
+    assert_eq!(
+        policy.classify(ErrorKind::DataUnavailable, grace - Duration::from_millis(1)),
+        Failure::Transient
+    );
+    assert_eq!(
+        policy.classify(ErrorKind::DataUnavailable, grace),
+        Failure::Persistent
+    );
+    assert_eq!(
+        policy.classify(ErrorKind::LimitExceeded, Duration::ZERO),
+        Failure::Persistent
+    );
+    assert_eq!(
+        policy.classify(ErrorKind::Busy, Duration::from_secs(3_600)),
+        Failure::Transient
+    );
 }

@@ -28,6 +28,13 @@ its sampled head, that block's `last_final_block` marker, and requested finality
 even when there are no blocks to apply. The marker is not a separately sampled
 current finalized head.
 
+`poll` holds the whole update in memory and fails it as a unit. For a long
+catch-up, call `head()` and `plan(checkpoint, head)` instead: the plan carries only
+headers, and `fetch_block(header)` fetches each planned block and checks it
+against its header. Apply and checkpoint the blocks in chunks of your choosing,
+so memory stays bounded and a failed request repeats only that block.
+`header(hash)` and `parent(header)` walk ancestry to a starting point of your own.
+
 Optimistic updates contain rollback headers newest first and replacement blocks
 oldest first, including when two heads have the same height. Undo those headers,
 apply all blocks, and save `next_checkpoint` in one consumer transaction. Ancestry
@@ -57,6 +64,17 @@ Carried chunks can still have `chunk: null`; full tracking does not make a chunk
 new. near-kit's configured retries handle transient transport/server errors;
 exhaustion is returned with the checkpoint untouched. Missing data is never
 silently treated as a successful empty block.
+
+`Error::kind()` names the failure, from the endpoint's error name where it has
+one (`BUSY`, `DATA_UNAVAILABLE`, `LIMIT_EXCEEDED`, ...). `RetryPolicy` turns it
+into a per-request `Backoff`: busy, timed-out and unreachable endpoints are
+transient, retried from 500 ms doubling to 10 s; unavailable data is transient
+for 30 s from the request's first failure, since an endpoint may announce a head
+before saving its data; anything else is persistent and backs off up to 60 s. A
+persistent block error such as `LIMIT_EXCEEDED` affects every consumer of that
+block and needs a fix on the serving node. The client still never sleeps or
+retries on its own. When pacing retries with `Backoff`, build the `RpcClient`
+with `RetryConfig::none()` so near-kit's retries do not stack underneath.
 
 ## Dependencies and compatibility
 

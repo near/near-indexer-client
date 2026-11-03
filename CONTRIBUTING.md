@@ -23,8 +23,9 @@ explicit-null/absent-field regression cases and verify against the intended
 nearcore build. The polling example can be run against a configured development
 node for a separate live check.
 
-Keep the client stateless and the API small. Consumers own persistence, retries,
-and rollback effects. Describe changes to checkpoint or ancestry semantics in
+Keep the client stateless and the API small. Consumers own persistence, when to
+retry, and rollback effects; the client only classifies errors and suggests
+retry delays. Describe changes to checkpoint or ancestry semantics in
 the changelog, and add a regression test for behavior changes.
 
 Use semantic branch prefixes (`feat/`, `fix/`, `docs/`, or `chore/`) and

@@ -7,6 +7,9 @@
 use std::collections::BTreeSet;
 
 pub use near_indexer_primitives::{CryptoHash, StreamerMessage};
+/// The `near-kit` version whose [`RpcClient`] [`Client::new`] takes and whose
+/// [`RpcError`] [`Error::Rpc`] carries, so callers need not pin it separately.
+pub use near_kit;
 use near_kit::rpc::{RpcClient, RpcError};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};

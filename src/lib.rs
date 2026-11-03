@@ -5,6 +5,7 @@
 //! state. The client never advances a cursor or acknowledges queue delivery.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 pub use near_indexer_primitives::{CryptoHash, StreamerMessage};
 /// The `near-kit` version whose [`RpcClient`] [`Client::new`] takes and whose
@@ -116,6 +117,43 @@ pub struct Update {
     pub next_checkpoint: Checkpoint,
 }
 
+/// The headers of an [`Update`], before any block is fetched.
+///
+/// Fetch [`Self::apply`] with [`Client::fetch_block`] in chunks of any size and
+/// persist each chunk's last header as the checkpoint, so a long catch-up keeps
+/// bounded memory and a failed fetch repeats only that block.
+///
+/// ```no_run
+/// use near_indexer_client::{Checkpoint, Client, Error};
+///
+/// async fn catch_up(client: &Client, mut saved: Checkpoint) -> Result<Checkpoint, Error> {
+///     let head = client.head().await?;
+///     let plan = client.plan(Some(&saved), head).await?;
+///     // An optimistic consumer undoes `plan.rollback` first.
+///     for chunk in plan.apply.chunks(32) {
+///         for header in chunk {
+///             // Retry a failed fetch on its own, paced by a `Backoff`.
+///             let _block = client.fetch_block(header).await?;
+///         }
+///         if let Some(last) = chunk.last() {
+///             // Persist the chunk's effects and this checkpoint together.
+///             saved = last.checkpoint();
+///         }
+///     }
+///     Ok(saved)
+/// }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// Sampled head; its checkpoint follows the last applied block.
+    pub head: Header,
+    /// Replaced ancestry to undo, newest first, as in [`Update::rollback`].
+    pub rollback: Vec<Header>,
+    /// Blocks to fetch and apply, oldest first, ending with [`Self::head`]
+    /// unless the head is the checkpoint itself.
+    pub apply: Vec<Header>,
+}
+
 /// Which head to follow. Optimistic consumers must implement rollback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -146,6 +184,209 @@ pub enum Error {
 impl From<RpcError> for Error {
     fn from(error: RpcError) -> Self {
         Self::Rpc(Box::new(error))
+    }
+}
+
+impl Error {
+    /// Classify the error, e.g. to choose a retry delay with [`Backoff`] or to
+    /// label it in metrics.
+    pub fn kind(&self) -> ErrorKind {
+        let rpc = match self {
+            Self::InvalidData(_) => return ErrorKind::InvalidData,
+            Self::AncestryLimit(_) => return ErrorKind::AncestryLimit,
+            Self::FinalityViolation => return ErrorKind::FinalityViolation,
+            Self::Rpc(rpc) => rpc.as_ref(),
+        };
+        let name = match rpc {
+            RpcError::Rpc { data, .. } => data
+                .as_ref()
+                .and_then(|data| data.get("name"))
+                .and_then(Value::as_str),
+            _ => None,
+        };
+        match name {
+            Some("BUSY") => ErrorKind::Busy,
+            Some("TIMEOUT_ERROR") => ErrorKind::Timeout,
+            Some("DATA_UNAVAILABLE") => ErrorKind::DataUnavailable,
+            Some("INCOMPLETE_DATA") => ErrorKind::IncompleteData,
+            Some("LIMIT_EXCEEDED") => ErrorKind::LimitExceeded,
+            Some("UNSUPPORTED") => ErrorKind::Unsupported,
+            Some(_) => ErrorKind::Rpc,
+            None if rpc.is_retryable() => ErrorKind::Unavailable,
+            None => ErrorKind::Rpc,
+        }
+    }
+}
+
+/// The class of an [`enum@Error`], from the endpoint's error name where it has one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// The endpoint is at its concurrent indexer request limit.
+    Busy,
+    /// The endpoint timed out serving the request.
+    Timeout,
+    /// A transport failure or other RPC error near-kit deems retryable.
+    Unavailable,
+    /// The block or its execution data is not available, possibly not yet.
+    DataUnavailable,
+    /// The endpoint's data for the block is inconsistent or incomplete.
+    IncompleteData,
+    /// The block's response exceeds the endpoint's size cap.
+    LimitExceeded,
+    /// The endpoint is not configured to serve indexer requests.
+    Unsupported,
+    /// Any other RPC error.
+    Rpc,
+    /// See [`Error::InvalidData`].
+    InvalidData,
+    /// See [`Error::AncestryLimit`].
+    AncestryLimit,
+    /// See [`Error::FinalityViolation`].
+    FinalityViolation,
+}
+
+impl ErrorKind {
+    /// A stable snake_case name, suitable as a metric label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Timeout => "timeout",
+            Self::Unavailable => "unavailable",
+            Self::DataUnavailable => "data_unavailable",
+            Self::IncompleteData => "incomplete_data",
+            Self::LimitExceeded => "limit_exceeded",
+            Self::Unsupported => "unsupported",
+            Self::Rpc => "rpc",
+            Self::InvalidData => "invalid_data",
+            Self::AncestryLimit => "ancestry_limit",
+            Self::FinalityViolation => "finality_violation",
+        }
+    }
+}
+
+/// Whether a retry is expected to clear a failure on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// The endpoint is momentarily unable to answer.
+    Transient,
+    /// The same request will likely keep failing until the endpoint changes;
+    /// for a block error, every consumer of that block is affected.
+    Persistent,
+}
+
+/// Pacing for retrying one request at a time.
+///
+/// The client never retries or sleeps itself; the consumer retries the failed
+/// request (not the whole update) after the [`Backoff`] delay. Build the
+/// [`RpcClient`] with `RetryConfig::none()` so near-kit's retries do not stack
+/// underneath.
+///
+/// ```
+/// use near_indexer_client::{Error, Failure, RetryPolicy};
+/// use std::time::Duration;
+///
+/// let mut backoff = RetryPolicy::default().backoff();
+/// let error = Error::InvalidData("broken ancestry");
+/// let retry = backoff.next(&error, Duration::ZERO);
+/// assert_eq!(retry.failure, Failure::Persistent);
+/// assert_eq!(retry.delay, Duration::from_millis(500));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Delay after the first failure; it doubles with each further failure.
+    pub initial_delay: Duration,
+    /// Cap on the delay while failures are [`Failure::Transient`].
+    pub max_transient_delay: Duration,
+    /// Cap on the delay once failures are [`Failure::Persistent`].
+    pub max_persistent_delay: Duration,
+    /// How long [`ErrorKind::DataUnavailable`] counts as transient, measured
+    /// from the request's first failure. An endpoint may announce a head
+    /// before it has saved that block's execution data.
+    pub data_unavailable_grace: Duration,
+}
+
+impl Default for RetryPolicy {
+    /// 500 ms doubling to 10 s while transient and 60 s once persistent, with
+    /// a 30 s grace for unavailable data.
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(500),
+            max_transient_delay: Duration::from_secs(10),
+            max_persistent_delay: Duration::from_secs(60),
+            data_unavailable_grace: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Classify an error of `kind` from a request failing for `failing_for`
+    /// since its first failure.
+    pub fn classify(&self, kind: ErrorKind, failing_for: Duration) -> Failure {
+        match kind {
+            ErrorKind::Busy | ErrorKind::Timeout | ErrorKind::Unavailable => Failure::Transient,
+            ErrorKind::DataUnavailable if failing_for < self.data_unavailable_grace => {
+                Failure::Transient
+            }
+            _ => Failure::Persistent,
+        }
+    }
+
+    /// Start pacing the retries of one failing request.
+    pub fn backoff(self) -> Backoff {
+        Backoff {
+            delay: self.initial_delay,
+            policy: self,
+        }
+    }
+}
+
+/// Retry delays for one failing request; start a new one per request.
+#[derive(Clone, Debug)]
+pub struct Backoff {
+    policy: RetryPolicy,
+    delay: Duration,
+}
+
+/// How to retry after one failed attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retry {
+    /// The class of the error.
+    pub kind: ErrorKind,
+    /// Whether the error is expected to clear on its own.
+    pub failure: Failure,
+    /// How long to wait before the next attempt.
+    pub delay: Duration,
+}
+
+impl Backoff {
+    /// Classify `error`, which the request has been failing with for
+    /// `failing_for` since its first failure, and return the delay before the
+    /// next attempt.
+    pub fn next(&mut self, error: &Error, failing_for: Duration) -> Retry {
+        let kind = error.kind();
+        let failure = self.policy.classify(kind, failing_for);
+        Retry {
+            kind,
+            failure,
+            delay: self.next_delay(failure),
+        }
+    }
+
+    /// The delay before the next attempt after a failure the consumer
+    /// classified itself, such as one in its own processing.
+    pub fn next_delay(&mut self, failure: Failure) -> Duration {
+        let cap = match failure {
+            Failure::Transient => self.policy.max_transient_delay,
+            Failure::Persistent => self.policy.max_persistent_delay,
+        };
+        let delay = self.delay.min(cap);
+        self.delay = self.delay.saturating_mul(2).min(
+            self.policy
+                .max_persistent_delay
+                .max(self.policy.max_transient_delay),
+        );
+        delay
     }
 }
 
@@ -209,19 +450,66 @@ impl Client {
         Ok(result)
     }
 
+    /// Fetch the block `header` describes, rejecting a payload whose height,
+    /// parent or finality marker differs from it. Coverage rules match [`Self::fetch`].
+    pub async fn fetch_block(&self, header: &Header) -> Result<IndexerBlock, Error> {
+        let block = self.fetch(header.hash).await?;
+        let actual = &block.message.block.header;
+        if actual.height != header.height
+            || actual.prev_hash != header.prev_hash
+            || actual.last_final_block != header.last_final_block
+        {
+            return Err(Error::InvalidData(
+                "indexer payload differs from ancestry header",
+            ));
+        }
+        Ok(block)
+    }
+
+    /// Sample the head header at the configured finality.
+    pub async fn head(&self) -> Result<Header, Error> {
+        self.block_header(json!({"finality": self.finality})).await
+    }
+
+    /// Read the header of one exact block hash.
+    pub async fn header(&self, hash: CryptoHash) -> Result<Header, Error> {
+        let header = self.block_header(json!({"block_id": hash})).await?;
+        if header.hash != hash {
+            return Err(Error::InvalidData(
+                "requested hash differs from returned header",
+            ));
+        }
+        Ok(header)
+    }
+
+    /// Read the parent header of `child`, rejecting a parent that does not
+    /// match `child.prev_hash` or is not below it.
+    pub async fn parent(&self, child: &Header) -> Result<Header, Error> {
+        let parent = self
+            .block_header(json!({"block_id": child.prev_hash}))
+            .await?;
+        if parent.hash != child.prev_hash || parent.height >= child.height {
+            return Err(Error::InvalidData("broken ancestry or no common ancestor"));
+        }
+        Ok(parent)
+    }
+
+    /// Walk hash ancestry from `head` back to `checkpoint` without fetching any
+    /// block. Pass a head sampled by [`Self::head`]: [`Finality::Final`] rejects
+    /// any rollback. Ancestry and checkpoint rules match [`Self::poll`].
+    pub async fn plan(&self, checkpoint: Option<&Checkpoint>, head: Header) -> Result<Plan, Error> {
+        self.plan_with(checkpoint, head, self.finality).await
+    }
+
     /// Sample a head, walk hash ancestry, then fetch the complete update.
     ///
     /// `None` starts with the current head only. A saved checkpoint resumes
     /// exclusively after that block. An unchanged head returns an empty update.
     /// Missing/pruned history, failed fetches, and excessive catch-up depth fail
     /// closed. Retain the old checkpoint on failure and retry at your own pace.
+    /// For bounded memory during a long catch-up, use [`Self::plan`] instead.
     pub async fn poll(&self, checkpoint: Option<&Checkpoint>) -> Result<Update, Error> {
-        if self.max_ancestry == 0 {
-            return Err(Error::AncestryLimit(0));
-        }
-        let head = self
-            .block_header(json!({"finality": self.finality}))
-            .await?;
+        let head = self.head().await?;
         self.update(checkpoint, head, self.finality).await
     }
 
@@ -234,15 +522,7 @@ impl Client {
         checkpoint: Option<&Checkpoint>,
         target: CryptoHash,
     ) -> Result<Update, Error> {
-        if self.max_ancestry == 0 {
-            return Err(Error::AncestryLimit(0));
-        }
-        let head = self.block_header(json!({"block_id": target})).await?;
-        if head.hash != target {
-            return Err(Error::InvalidData(
-                "target hash differs from returned header",
-            ));
-        }
+        let head = self.header(target).await?;
         self.update(checkpoint, head, Finality::Optimistic).await
     }
 
@@ -252,30 +532,37 @@ impl Client {
         head: Header,
         finality: Finality,
     ) -> Result<Update, Error> {
-        let (rollback, apply) = self.plan(checkpoint, head).await?;
-        if finality == Finality::Final && !rollback.is_empty() {
-            return Err(Error::FinalityViolation);
-        }
-        let mut blocks = Vec::with_capacity(apply.len());
-        for header in apply {
-            let block = self.fetch(header.hash).await?;
-            let actual = &block.message.block.header;
-            if actual.height != header.height
-                || actual.prev_hash != header.prev_hash
-                || actual.last_final_block != header.last_final_block
-            {
-                return Err(Error::InvalidData(
-                    "indexer payload differs from ancestry header",
-                ));
-            }
-            blocks.push(block);
+        let plan = self.plan_with(checkpoint, head, finality).await?;
+        let mut blocks = Vec::with_capacity(plan.apply.len());
+        for header in &plan.apply {
+            blocks.push(self.fetch_block(header).await?);
         }
         Ok(Update {
             finality,
             head,
-            rollback,
+            rollback: plan.rollback,
             blocks,
             next_checkpoint: head.checkpoint(),
+        })
+    }
+
+    async fn plan_with(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        head: Header,
+        finality: Finality,
+    ) -> Result<Plan, Error> {
+        if self.max_ancestry == 0 {
+            return Err(Error::AncestryLimit(0));
+        }
+        let (rollback, apply) = self.walk(checkpoint, head).await?;
+        if finality == Finality::Final && !rollback.is_empty() {
+            return Err(Error::FinalityViolation);
+        }
+        Ok(Plan {
+            head,
+            rollback,
+            apply,
         })
     }
 
@@ -287,17 +574,7 @@ impl Client {
         Ok(self.rpc.call::<_, Block>("block", params).await?.header)
     }
 
-    async fn parent(&self, child: &Header) -> Result<Header, Error> {
-        let parent = self
-            .block_header(json!({"block_id": child.prev_hash}))
-            .await?;
-        if parent.hash != child.prev_hash || parent.height >= child.height {
-            return Err(Error::InvalidData("broken ancestry or no common ancestor"));
-        }
-        Ok(parent)
-    }
-
-    async fn plan(
+    async fn walk(
         &self,
         checkpoint: Option<&Checkpoint>,
         head: Header,
